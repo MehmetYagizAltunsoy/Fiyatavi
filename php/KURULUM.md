@@ -39,6 +39,15 @@ Fiyatlar birkaç turda dolar (her tur en fazla `TICK_BUDGET` saniye çalışır,
 
 Node sürümünün ön yüzünü değiştirdiysen: `bash sync-assets.sh` (public/ → php/ kopyalar).
 
+## XAMPP ile çalıştırma
+
+1. `php/` klasörünün **içindekileri** (klasörün kendisini değil) `htdocs` altında bir klasöre kopyala, örneğin `C:\xampp\htdocs\fiyatavi\` (yani `index.php`, `inc/`, `app.html` vb. doğrudan o klasörün içinde olmalı).
+2. XAMPP Kontrol Panelinden **Apache**'yi başlat (MySQL gerekmiyor, veri tabanı SQLite — `data/` klasöründe dosya olarak tutulur).
+3. `.env.example` dosyasını aynı klasörde `.env` yap, içine kendi `ITAD_API_KEY` anahtarını yaz ([isthereanydeal.com/apps/my](https://isthereanydeal.com/apps/my/) üzerinden ücretsiz alınır).
+4. `mod_rewrite` açık olmalı (adresler `.htaccess` ile `index.php`'ye yönlendiriliyor): `C:\xampp\apache\conf\httpd.conf` içinde `LoadModule rewrite_module modules/mod_rewrite.so` satırının başındaki `#` kaldırılmalı; aynı dosyada `AllowOverride None` yazan yerler `htdocs` için `AllowOverride All` olmalı (XAMPP'ta genelde zaten böyledir). Değiştirdiysen Apache'yi yeniden başlat.
+5. Tarayıcıda `http://localhost/fiyatavi/`. Boş sayfa ya da 404 görürsen önce `http://localhost/fiyatavi/api/health` adresini dene — `{"ok":true...}` gelmiyorsa `mod_rewrite` kapalıdır (4. adıma bak).
+6. Oyun listesi ilk açılışta boştur; bir kez `php bin/kontrol.php` yerine tarayıcıdan `cron.php` adresine gitmek yeterli değildir — terminalden (XAMPP'ın `php.exe`'siyle) şunu çalıştır: `C:\xampp\php\php.exe cron.php` (klasörün içindeyken). Fiyatlar birkaç turda dolar.
+
 ## Arka plan işleri nasıl çalışır?
 
 Node sürümü sürekli açık kalıp saatte bir fiyatları günceller. PHP istek bitince kapanır, bu yüzden iş **zamanlanır**:

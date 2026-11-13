@@ -1,0 +1,13 @@
+# Apache (XAMPP, cPanel vb.) için: php -S ile kullanılan router.php'nin karşılığı.
+# Gerçekten var olan statik dosyalar (resim, css, js, sw.js...) doğrudan verilir;
+# geri kalan her istek index.php'ye gider. inc/ data/ test/ bin/ klasörleri ve
+# .php/.env/.db/.sh/.md uzantılı dosyalar asla doğrudan verilmez.
+RewriteEngine On
+
+RewriteCond %{REQUEST_URI} !^/(inc|data|test|bin)/
+RewriteCond %{REQUEST_URI} !\.(php|env|db|sh|md)$ [NC]
+RewriteCond %{REQUEST_URI} !^/app\.html$
+RewriteCond %{DOCUMENT_ROOT}%{REQUEST_URI} -f
+RewriteRule ^ - [L]
+
+RewriteRule ^ index.php [L]
