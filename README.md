@@ -11,9 +11,9 @@ Projenin **iki ayrı sunucu tarafı** vardır, ikisi de bu depoda bulunur ve ayn
 
 ## Tanıtım videosu
 
-[![Fiyatavı tanıtım videosu](docs/fiyatavi_tanitim_thumb.jpg)](docs/fiyatavi_tanitim.mp4)
+[![Fiyatavı tanıtım videosu](docs/fiyatavi_tanitim_thumb.jpg)](https://drive.google.com/TANITIM_VIDEOSU_LINKI)
 
-Videoyu izlemek için görsele tıklayın ya da [docs/fiyatavi_tanitim.mp4](docs/fiyatavi_tanitim.mp4) dosyasını açın.
+Videoyu izlemek için görsele tıklayın.
 
 ## Özellikler
 
