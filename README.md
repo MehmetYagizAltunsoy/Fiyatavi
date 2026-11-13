@@ -9,6 +9,12 @@ Projenin **iki ayrı sunucu tarafı** vardır, ikisi de bu depoda bulunur ve ayn
 - **`/` (kök dizin) — Node.js / Express sürümü:** Sitenin asıl, sürekli geliştirilen sürümü.
 - **`/php` — PHP 8 sürümü:** Aynı sitenin PHP ile yazılmış, aynı veri tabanı şemasını kullanan karşılığı (paylaşımlı/ücretsiz PHP barındırma gibi Node çalıştıramayan ortamlarda kullanılmak üzere).
 
+## Tanıtım videosu
+
+[![Fiyatavı tanıtım videosu](docs/fiyatavi_tanitim_thumb.jpg)](docs/fiyatavi_tanitim.mp4)
+
+Videoyu izlemek için görsele tıklayın ya da [docs/fiyatavi_tanitim.mp4](docs/fiyatavi_tanitim.mp4) dosyasını açın.
+
 ## Özellikler
 
 - Türkiye mağazalarının gerçek fiyatları (TL)
