@@ -1,0 +1,16 @@
+{
+  "name": "Fiyatavı — Türk oyuncular için oyun fiyat karşılaştırma",
+  "short_name": "Fiyatavı",
+  "description": "Steam, Epic, GOG ve diğer mağazalardaki fiyatları TL olarak karşılaştır, fiyatı düşünce haber al.",
+  "lang": "tr",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#13152A",
+  "theme_color": "#13152A",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/icon-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

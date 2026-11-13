@@ -1,0 +1,835 @@
+import "dotenv/config";
+import express from "express";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { db, tx } from "./db.js";
+import { runSync, COUNTRIES, ensureHistory, ensureInfo, syncPricesFor, searchRemote, startBackgroundWork, HISTORY_MONTHS,
+  ensureRating, queuePriority, spotlightMedia, ensureDetails, ensureAppids } from "./sync.js";
+import { CATEGORIES } from "./steamspy.js";
+import {
+  hashPassword, verifyPassword, createSession, destroySession, cleanupSessions,
+  sessionCookie, attachUser, requireUser, tooManyAttempts,
+  createEmailToken, consumeEmailToken, destroyUserSessions,
+} from "./auth.js";
+import { sendAccountMail } from "./accountmail.js";
+import { notifyAdded, sendWeeklyDigests } from "./notify.js";
+import { checkShops, purgeBlocked } from "./shops.js";
+import { refreshRates, currentRates } from "./rates.js";
+import { usage as itadUsage, RATE_LIMIT as ITAD_LIMIT } from "./itad.js";
+import fs from "node:fs";
+import crypto from "node:crypto";
+
+const app = express();
+// Tünel (Cloudflare) ya da nginx gibi aynı bilgisayardaki bir aracıdan gelen isteklerde ziyaretçinin gerçek adresini kullan.
+// Sadece bu bilgisayardan (loopback) gelen aracıya güvenilir; dışarıdan sahte başlık gönderilerek kandırılamaz.
+app.set("trust proxy", "loopback");
+const root = path.dirname(fileURLToPath(import.meta.url));
+const PROD = process.env.NODE_ENV === "production";
+const SITE_URL = (process.env.SITE_URL || `http://localhost:${process.env.PORT || 3000}`).replace(/\/$/, "");
+
+// Güvenlik başlıkları: site başka sitelerin içine gömülemez, tarayıcı dosya türünü tahmin etmez,
+// sayfa sadece izin verilen yerlerden kod/yazı tipi yükler. Görseller ve fragmanlar mağaza sunucularından gelir.
+app.use((_req, res, next) => {
+  res.set({
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+    "Content-Security-Policy": [
+      "default-src 'self'", "script-src 'self' 'unsafe-inline'", "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+      "font-src 'self' https://fonts.gstatic.com", "img-src 'self' data: https:", "media-src 'self' https:",
+      "connect-src 'self'", "frame-ancestors 'none'", "base-uri 'self'", "form-action 'self'", "object-src 'none'",
+    ].join("; "),
+  });
+  if (PROD) res.set("Strict-Transport-Security", "max-age=31536000");
+  next();
+});
+app.use(express.json({ limit: "10kb" }));
+app.use(attachUser);
+
+// Sayfa: paylaşım önizlemesi (Instagram, WhatsApp, Discord…) için başlık ve görseli sunucuda doldurur.
+// Oyun adresinde (/oyun/<kısa ad>) önizlemede o oyunun adı, fiyatı ve kapağı görünür.
+const INDEX = fs.readFileSync(path.join(root, "..", "public", "index.html"), "utf8");
+const escAttr = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+function page(og = {}) {
+  const title = og.title || "Fiyatavı — Türk oyuncular için oyun fiyat karşılaştırma";
+  const desc = og.desc || "Steam, Epic, GOG ve diğer mağazalardaki fiyatları TL olarak karşılaştır, en ucuzunu bul, fiyatı düşünce haber al.";
+  const img = og.image || `${SITE_URL}/og.png`;
+  const big = !og.image || og.wide;
+  const tags = `<!--OG-->
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Fiyatavı">
+<meta property="og:locale" content="tr_TR">
+<meta property="og:url" content="${escAttr(SITE_URL + (og.path || "/"))}">
+<meta property="og:title" content="${escAttr(title)}">
+<meta property="og:description" content="${escAttr(desc)}">
+<meta property="og:image" content="${escAttr(img)}">
+${big ? '<meta property="og:image:width" content="1200">\n<meta property="og:image:height" content="630">' : ""}
+<meta name="twitter:card" content="${big ? "summary_large_image" : "summary"}">
+<meta name="theme-color" content="#13152A">
+<link rel="canonical" href="${escAttr(SITE_URL + (og.path || "/"))}">
+<!--/OG-->`;
+  return INDEX.replace(/<!--OG-->[\s\S]*?<!--\/OG-->/, tags);
+}
+const sendPage = (res, og) => res.type("html").set("Cache-Control", "no-cache").send(page(og));
+app.get(["/", "/index.html"], (_req, res) => sendPage(res));
+app.use(express.static(path.join(root, "..", "public"), { index: false }));
+// Paylaşılabilir oyun adresi: /oyun/<kısa ad>. Sayfa aynı, oyunu tarayıcıdaki kod açar.
+app.get("/oyun/:key", (req, res) => {
+  const k = String(req.params.key).slice(0, 200);
+  const g = db.prepare("SELECT id, slug, title, appid, boxart FROM games WHERE (slug = ? OR id = ?) AND hidden = 0").get(k, k);
+  if (!g) return sendPage(res);
+  const lo = db.prepare("SELECT shop, price, regular, cut, currency FROM lows WHERE game_id = ? AND country = 'TR'").get(g.id);
+  const tl = (v) => new Intl.NumberFormat("tr-TR", { style: "currency", currency: lo?.currency || "TRY" }).format(v);
+  const desc = lo
+    ? (lo.cut > 0 ? `En ucuz: ${tl(lo.price)} (${lo.shop}, %${lo.cut} indirim, normalde ${tl(lo.regular)}).` : `En ucuz: ${tl(lo.price)} (${lo.shop}).`) + " Fiyatı düşünce haber almak için takibe al."
+    : "Bu oyunun mağaza fiyatlarını karşılaştır, fiyatı düşünce haber al.";
+  const image = g.appid ? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${g.appid}/header.jpg` : g.boxart || null;
+  sendPage(res, { title: `${g.title} — Fiyatavı`, desc, image, wide: !!g.appid, path: `/oyun/${encodeURIComponent(g.slug || g.id)}` });
+});
+
+// Arama motorları için
+app.get("/robots.txt", (_req, res) => res.type("text/plain").send(`User-agent: *\nAllow: /\nDisallow: /api/\nSitemap: ${SITE_URL}/sitemap.xml\n`));
+let sitemapCache = { at: 0, xml: "" };
+app.get("/sitemap.xml", (_req, res) => {
+  if (Date.now() - sitemapCache.at > 6 * 3_600_000) {
+    const rows = db.prepare(`SELECT slug FROM games WHERE hidden = 0 AND slug IS NOT NULL
+      ORDER BY popular_rank IS NULL, popular_rank, owners IS NULL, owners DESC LIMIT 5000`).all();
+    const urls = [`${SITE_URL}/`, ...rows.map((r) => `${SITE_URL}/oyun/${encodeURIComponent(r.slug)}`)];
+    sitemapCache = { at: Date.now(), xml: `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urls.map((u) => `<url><loc>${escAttr(u)}</loc></url>`).join("\n")}\n</urlset>\n` };
+  }
+  res.type("application/xml").send(sitemapCache.xml);
+});
+// Sunucunun ayakta olup olmadığını kontrol etmek için (izleme servisleri kullanır)
+app.get("/api/health", (_req, res) => { db.prepare("SELECT 1").get(); res.json({ ok: true, uptime: Math.round(process.uptime()) }); });
+
+/* ---------- Oyunlar ve fiyatlar ---------- */
+const PAGE_SIZE = 60;
+const qGame = db.prepare("SELECT * FROM games WHERE id = ?");
+const qPrices = db.prepare(`SELECT shop_name AS shop, price, regular, currency, cut, expiry, url
+  FROM prices WHERE game_id = ? AND country = ? ORDER BY price`);
+const qHistory = db.prepare(`SELECT substr(day, 1, 7) AS month, MIN(lowest) AS lowest, currency
+  FROM price_history
+  WHERE game_id = ? AND country = ?
+    AND day >= date('now', 'start of month', ?) AND day < date('now', 'start of month')
+  GROUP BY month ORDER BY month`);
+const qLow = db.prepare("SELECT shop, price, regular, currency, cut, expiry, low_m3, low_all FROM lows WHERE game_id = ? AND country = ?");
+const qMeta = db.prepare("SELECT value FROM meta WHERE key = 'last_sync'");
+const markViewed = db.prepare("UPDATE games SET viewed_at = datetime('now') WHERE id = ?");
+const validCountry = (req) => {
+  const c = String(req.query.country || "TR").toUpperCase();
+  return COUNTRIES.includes(c) ? c : null;
+};
+
+// Liste satırı: kart için gereken bilgiler
+const GAME_COLS = `g.id, g.slug, g.title, g.boxart, g.appid, g.release_date, g.tags, g.popular_rank, g.free,
+  g.rating_pos, g.rating_neg, g.last_priced, g.mature`;
+// 7 gün önceki en düşük fiyat (aynı para biriminde): kartlardaki "7 günde %X düştü" etiketi için
+const PREV7 = `(SELECT h.lowest FROM price_history h WHERE h.game_id = l.game_id AND h.country = l.country AND h.currency = l.currency
+    AND h.day <= date('now', '-7 days') ORDER BY h.day DESC LIMIT 1) AS l_prev7`;
+const LOW_COLS = `l.shop AS l_shop, l.price AS l_price, l.regular AS l_regular, l.currency AS l_currency,
+  l.cut AS l_cut, l.expiry AS l_expiry, l.low_m3 AS l_m3, l.low_all AS l_all, ${PREV7}`;
+const SHOP_COLS = `l.shop_name AS l_shop, l.price AS l_price, l.regular AS l_regular, l.currency AS l_currency,
+  l.cut AS l_cut, l.expiry AS l_expiry, NULL AS l_m3, NULL AS l_all, ${PREV7}`;
+const LIST_COLS = `${GAME_COLS}, ${LOW_COLS}`;
+function listItem(r) {
+  return {
+    id: r.id,
+    slug: r.slug ?? null,
+    title: r.title,
+    boxart: r.boxart,
+    appid: r.appid,
+    releaseDate: r.release_date,
+    tags: JSON.parse(r.tags || "[]").slice(0, 2),
+    popularRank: r.popular_rank,
+    free: !!r.free,
+    mature: !!r.mature,
+    pending: !r.last_priced,
+    rating: r.rating_pos != null && r.rating_pos + r.rating_neg > 0 ? { pos: r.rating_pos, neg: r.rating_neg } : null,
+    low: r.l_price == null ? null
+      : { shop: r.l_shop, price: r.l_price, regular: r.l_regular, currency: r.l_currency, cut: r.l_cut, expiry: r.l_expiry,
+          lowM3: r.l_m3, lowAll: r.l_all, prev7: r.l_prev7 ?? null },
+  };
+}
+
+// Sıralamalar
+const unpricedLast = "(l.price IS NULL AND g.free = 0)";
+const ratingScore = "((g.rating_pos + 1.0) / (g.rating_pos + g.rating_neg + 2))";
+const ORDERS = {
+  popular: `${unpricedLast}, g.popular_rank IS NULL, g.popular_rank, g.collected_rank IS NULL, g.collected_rank, g.owners IS NULL, g.owners DESC, g.title COLLATE NOCASE`,
+  bestsellers: `${unpricedLast}, g.collected_rank IS NULL, g.collected_rank, g.owners IS NULL, g.owners DESC, g.popular_rank IS NULL, g.popular_rank`,
+  favorites: `${unpricedLast}, g.waitlist_rank IS NULL, g.waitlist_rank, g.popular_rank IS NULL, g.popular_rank, g.owners IS NULL, g.owners DESC`,
+  rating: `(COALESCE(g.rating_pos, 0) + COALESCE(g.rating_neg, 0) < 50), ${ratingScore} DESC, g.rating_pos DESC`,
+  price_asc: `l.usd IS NULL, l.usd, g.title COLLATE NOCASE`,
+  price_desc: `l.usd IS NULL, l.usd DESC, g.title COLLATE NOCASE`,
+  discount: `${unpricedLast}, COALESCE(l.cut, 0) DESC, g.popular_rank IS NULL, g.popular_rank`,
+  az: `g.title COLLATE NOCASE`,
+  newest: `g.release_date IS NULL, g.release_date DESC, g.title COLLATE NOCASE`,
+};
+
+// Filtreli sorgu: arama, harf, kategori, mağaza, sadece indirimdekiler, fiyatı olmayanlar
+function buildQuery(req, country) {
+  const q = String(req.query.q || "").trim().slice(0, 80);
+  const letter = /^[A-Z]$/.test(req.query.letter || "") ? req.query.letter : null;
+  const cat = String(req.query.cat || "").slice(0, 40);
+  const shop = String(req.query.shop || "").slice(0, 60);
+  const where = ["g.hidden = 0"], args = [];
+  let join, cols;
+  if (shop) {
+    join = "JOIN prices l ON l.game_id = g.id AND l.country = ? AND l.shop_name = ?";
+    args.push(country, shop); cols = SHOP_COLS;
+  } else {
+    join = "LEFT JOIN lows l ON l.game_id = g.id AND l.country = ?";
+    args.push(country); cols = LOW_COLS;
+    if (req.query.all !== "1") {
+      // varsayılan: Türkiye'de fiyatı olanlar ve ücretsiz oyunlar
+      where.push("(l.price IS NOT NULL OR g.free = 1)");
+    }
+  }
+  if (req.query.deals === "1") where.push("l.cut > 0");
+  if (q) { where.push("g.title LIKE ? ESCAPE '\\'"); args.push(`%${q.replace(/[\\%_]/g, (c) => "\\" + c)}%`); }
+  if (letter) { where.push("upper(substr(g.title, 1, 1)) = ?"); args.push(letter); }
+  if (cat) { where.push("EXISTS (SELECT 1 FROM game_tags t WHERE t.game_id = g.id AND t.tag = ?)"); args.push(cat); }
+  return { from: `FROM games g ${join} WHERE ${where.join(" AND ")}`, args, cols };
+}
+
+app.get("/api/games", (req, res) => {
+  const country = validCountry(req);
+  if (!country) return res.status(400).json({ code: "country" });
+  const page = Math.max(0, Math.min(Number(req.query.page) || 0, 2000));
+  const size = Math.max(1, Math.min(Number(req.query.limit) || PAGE_SIZE, PAGE_SIZE));
+  const { from, args, cols } = buildQuery(req, country);
+  const order = "ORDER BY " + (ORDERS[String(req.query.sort)] || ORDERS.popular);
+  const total = db.prepare(`SELECT COUNT(*) AS n ${from}`).get(...args).n;
+  const rows = db.prepare(`SELECT ${GAME_COLS}, ${cols} ${from} ${order} LIMIT ${size} OFFSET ${page * size}`)
+    .all(...args);
+  const games = rows.map(listItem);
+  // fiyatı hiç çekilmemiş oyunlar ekranda göründüyse sıranın başına al
+  const pend = games.filter((g) => g.pending).map((g) => g.id);
+  if (pend.length) queuePriority(pend);
+  res.json({ country, updatedAt: qMeta.get()?.value ?? null, total, pageSize: size, games });
+});
+
+// İndirimdeki popüler oyunlar (mağaza seçiliyse o mağazadaki indirimler)
+app.get("/api/deals", (req, res) => {
+  const country = validCountry(req);
+  if (!country) return res.status(400).json({ code: "country" });
+  const shop = String(req.query.shop || "").slice(0, 60);
+  const rows = shop
+    ? db.prepare(`SELECT ${GAME_COLS}, ${SHOP_COLS} FROM games g JOIN prices l ON l.game_id = g.id AND l.country = ? AND l.shop_name = ?
+        WHERE g.hidden = 0 AND l.cut > 0 ORDER BY g.popular_rank IS NULL, g.popular_rank, g.owners IS NULL, g.owners DESC LIMIT 12`).all(country, shop)
+    : db.prepare(`SELECT ${LIST_COLS} FROM games g JOIN lows l ON l.game_id = g.id AND l.country = ?
+        WHERE g.hidden = 0 AND g.popular_rank IS NOT NULL AND l.cut > 0 ORDER BY g.popular_rank LIMIT 12`).all(country);
+  res.json({ games: rows.map(listItem) });
+});
+
+// Fiyat veren mağazalar (mağaza filtresi için)
+const shopsCache = new Map();
+app.get("/api/shops", (req, res) => {
+  const country = validCountry(req);
+  if (!country) return res.status(400).json({ code: "country" });
+  const c = shopsCache.get(country);
+  if (c && Date.now() - c.at < 30 * 60_000) return res.json({ shops: c.data });
+  const data = db.prepare(`SELECT shop_name AS name, COUNT(*) AS n FROM prices WHERE country = ?
+    GROUP BY shop_name HAVING n >= 5 ORDER BY n DESC`).all(country).map((r) => ({ ...r }));
+  shopsCache.set(country, { at: Date.now(), data });
+  res.json({ shops: data });
+});
+
+// Kategoriler ve oyun sayıları
+let catCache = { at: 0, data: null };
+app.get("/api/categories", (_req, res) => {
+  if (!catCache.data || Date.now() - catCache.at > 30 * 60_000) {
+    const cnt = db.prepare("SELECT COUNT(*) AS n FROM game_tags t JOIN games g ON g.id = t.game_id WHERE t.tag = ? AND g.hidden = 0");
+    catCache = { at: Date.now(), data: CATEGORIES.map(([tag, tr, en]) => ({ tag, tr, en, n: cnt.get(tag).n })) };
+  }
+  res.json({ categories: catCache.data });
+});
+
+// Vitrin: indirimdeki popüler oyunlar, Steam ekran görüntüleriyle (kayan slaytlar)
+const showCache = new Map();
+app.get("/api/showcase", async (req, res) => {
+  const country = validCountry(req);
+  if (!country) return res.status(400).json({ code: "country" });
+  const shop = String(req.query.shop || "").slice(0, 60);
+  const key = country + "|" + shop;
+  const hit = showCache.get(key);
+  if (hit && Date.now() - hit.at < 60 * 60_000) return res.json(hit.data);
+  // vitrin (ana sayfanın büyük kayan slaytları) öne çıkan bir yer olduğu için +18 oyunlar hiç aday olmaz
+  const sql = shop
+    ? `SELECT ${GAME_COLS}, ${SHOP_COLS} FROM games g JOIN prices l ON l.game_id = g.id AND l.country = ? AND l.shop_name = ?
+       WHERE g.hidden = 0 AND g.mature = 0 AND l.cut > 0 ORDER BY g.popular_rank IS NULL, g.popular_rank, g.collected_rank IS NULL, g.collected_rank, g.owners IS NULL, g.owners DESC LIMIT 20`
+    : `SELECT ${LIST_COLS} FROM games g JOIN lows l ON l.game_id = g.id AND l.country = ?
+       WHERE g.hidden = 0 AND g.mature = 0 AND l.cut > 0 AND (g.popular_rank IS NOT NULL OR g.collected_rank IS NOT NULL OR g.waitlist_rank IS NOT NULL)
+       ORDER BY COALESCE(g.popular_rank, g.collected_rank + 1000, g.waitlist_rank + 2000) LIMIT 20`;
+  const args = shop ? [country, shop] : [country];
+  let rows = db.prepare(sql).all(...args);
+  try { await ensureAppids(rows.filter((r) => !r.appid).map((r) => r.id)); } catch {}
+  rows = db.prepare(sql).all(...args);
+  // ekran görüntülerini paralel getir (bir kez çekilir, sonra 7 gün saklanır)
+  const media = await Promise.allSettled(rows.slice(0, 12).map((r) => (r.appid ? ensureDetails(r.id, r.appid) : null)));
+  const slides = [];
+  rows.slice(0, 12).forEach((r, i) => {
+    const m = media[i].status === "fulfilled" ? media[i].value : null;
+    const shots = JSON.parse(m?.shots || "[]");
+    if (!shots.length && !m?.poster) return;
+    slides.push({ ...listItem(r), shots: shots.length ? shots : [m.poster] });
+  });
+  const data = { games: slides.slice(0, 10) };
+  showCache.set(key, { at: data.games.length ? Date.now() : Date.now() - 50 * 60_000, data });
+  res.json(data);
+});
+
+// Şu an ücretsiz: normalde ücretli olup şu an 0 fiyatla verilen oyunlar (Epic'in haftalık ücretsiz oyunları gibi)
+const freeCache = new Map();
+app.get("/api/free", (req, res) => {
+  const country = validCountry(req);
+  if (!country) return res.status(400).json({ code: "country" });
+  const hit = freeCache.get(country);
+  if (hit && Date.now() - hit.at < 15 * 60_000) return res.json(hit.data);
+  const rows = db.prepare(`SELECT ${GAME_COLS}, ${SHOP_COLS} FROM games g
+    JOIN prices l ON l.game_id = g.id AND l.country = ? AND l.price = 0 AND l.regular > 0
+    WHERE g.hidden = 0
+    ORDER BY g.popular_rank IS NULL, g.popular_rank, g.owners IS NULL, g.owners DESC, l.regular DESC LIMIT 12`).all(country);
+  const seen = new Set(), games = [];
+  for (const r of rows) if (!seen.has(r.id)) { seen.add(r.id); games.push(listItem(r)); }
+  const data = { games };
+  freeCache.set(country, { at: Date.now(), data });
+  res.json(data);
+});
+
+// Bu hafta biten indirimler: önümüzdeki 7 gün içinde süresi dolacak indirimler, en yakın biten önce.
+// Rastgele ucuz oyunlar dolmasın diye sadece bilinen oyunlar (popüler, çok satan ya da çok değerlendirilmiş).
+const endingCache = new Map();
+app.get("/api/ending", (req, res) => {
+  const country = validCountry(req);
+  if (!country) return res.status(400).json({ code: "country" });
+  const hit = endingCache.get(country);
+  if (hit && Date.now() - hit.at < 10 * 60_000) return res.json(hit.data);
+  const rows = db.prepare(`SELECT ${GAME_COLS}, ${LOW_COLS} FROM games g
+    JOIN lows l ON l.game_id = g.id AND l.country = ?
+    WHERE g.hidden = 0 AND l.cut > 0 AND l.price > 0 AND l.expiry IS NOT NULL
+      AND datetime(l.expiry) > datetime('now') AND datetime(l.expiry) <= datetime('now', '+7 days')
+      AND (g.popular_rank IS NOT NULL OR g.collected_rank IS NOT NULL OR COALESCE(g.rating_pos, 0) + COALESCE(g.rating_neg, 0) >= 500)
+    ORDER BY datetime(l.expiry), l.cut DESC LIMIT 12`).all(country);
+  const data = { games: rows.map(listItem) };
+  endingCache.set(country, { at: Date.now(), data });
+  res.json(data);
+});
+
+// Fırsat rafları: 100 TL altı, tarihi en düşük fiyatta, son 7 günde ucuzlayanlar (10 dakikada bir hesaplanır)
+const shelvesCache = new Map();
+const KNOWN = "(g.popular_rank IS NOT NULL OR g.collected_rank IS NOT NULL OR COALESCE(g.rating_pos, 0) + COALESCE(g.rating_neg, 0) >= 300)";
+const POPULAR_ORDER = "g.popular_rank IS NULL, g.popular_rank, g.owners IS NULL, g.owners DESC";
+app.get("/api/shelves", (req, res) => {
+  const country = validCountry(req);
+  if (!country) return res.status(400).json({ code: "country" });
+  const hit = shelvesCache.get(country);
+  if (hit && Date.now() - hit.at < 10 * 60_000) return res.json(hit.data);
+  const base = `SELECT ${LIST_COLS} FROM games g JOIN lows l ON l.game_id = g.id AND l.country = ? WHERE g.hidden = 0 AND l.price > 0 AND ${KNOWN}`;
+  const under100 = db.prepare(`${base} AND l.currency = 'TRY' AND l.price <= 100 ORDER BY ${POPULAR_ORDER} LIMIT 12`).all(country);
+  const atl = db.prepare(`${base} AND l.cut > 0 AND l.low_all IS NOT NULL AND l.price <= l.low_all + 0.005 ORDER BY ${POPULAR_ORDER} LIMIT 12`).all(country);
+  const dropped = db.prepare(`SELECT * FROM (${base}) WHERE l_prev7 IS NOT NULL AND l_price < l_prev7 * 0.9
+    ORDER BY (l_prev7 - l_price) / l_prev7 DESC LIMIT 12`).all(country);
+  const data = { under100: under100.map(listItem), atl: atl.map(listItem), dropped: dropped.map(listItem) };
+  shelvesCache.set(country, { at: Date.now(), data });
+  res.json(data);
+});
+
+// Benzer oyunlar: ortak etiketi en çok olan, fiyatı belli oyunlar (çok genel etiketler sayılmaz)
+const GENERIC_TAGS = ["Indie", "Singleplayer", "Multiplayer", "Casual", "Free to Play", "Early Access", "Great Soundtrack", "Atmospheric", "2D", "3D", "Colorful"];
+const simCache = new Map();
+app.get("/api/games/:id/similar", (req, res) => {
+  const country = validCountry(req);
+  if (!country) return res.status(400).json({ code: "country" });
+  const key = req.params.id + country;
+  const hit = simCache.get(key);
+  if (hit && Date.now() - hit.at < 60 * 60_000) return res.json(hit.data);
+  const rows = db.prepare(`SELECT ${LIST_COLS}, COUNT(*) AS shared
+    FROM game_tags t
+    JOIN game_tags t2 ON t2.tag = t.tag AND t2.game_id <> t.game_id
+    JOIN games g ON g.id = t2.game_id
+    JOIN lows l ON l.game_id = g.id AND l.country = ?
+    WHERE t.game_id = ? AND t.tag NOT IN (${GENERIC_TAGS.map(() => "?").join(",")}) AND g.hidden = 0
+    GROUP BY g.id
+    ORDER BY shared DESC, g.popular_rank IS NULL, g.popular_rank, g.owners IS NULL, g.owners DESC
+    LIMIT 8`).all(country, req.params.id, ...GENERIC_TAGS);
+  const data = { games: rows.map(listItem) };
+  simCache.set(key, { at: Date.now(), data });
+  res.json(data);
+});
+
+// Oyun sayfası: bilgi, tüm mağaza fiyatları ve 3 aylık geçmiş (eksikse o an çekilir)
+const priceTried = new Set();
+app.get("/api/games/:id", async (req, res) => {
+  const country = validCountry(req);
+  if (!country) return res.status(400).json({ code: "country" });
+  // adres oyunun kimliği ya da kısa adı (slug) olabilir: /oyun/elden-ring
+  let id = req.params.id;
+  if (!qGame.get(id)) {
+    const bySlug = db.prepare("SELECT id FROM games WHERE slug = ? AND hidden = 0").get(id);
+    if (!bySlug) return res.status(404).json({ code: "game" });
+    id = bySlug.id;
+  }
+  markViewed.run(id);
+  const qDaily = db.prepare(`SELECT day, lowest, currency FROM price_history
+    WHERE game_id = ? AND country = ? AND day >= date('now', ?) ORDER BY day`);
+  const jobs = [ensureInfo(id), ensureHistory(id, country), ensureRating(id), ensureDetails(id)];
+  if (!qPrices.all(id, country).length && !priceTried.has(id + country)) {
+    priceTried.add(id + country);
+    jobs.push(syncPricesFor([id], [country]));
+    queuePriority([id]);
+  }
+  for (const r of await Promise.allSettled(jobs)) if (r.status === "rejected") console.error("  oyun ayrıntısı:", r.reason?.message);
+  const g = qGame.get(id);
+  const low = qLow.get(id, country);
+  res.json({ game: {
+    ...listItem({ ...g, l_shop: low?.shop, l_price: low?.price, l_regular: low?.regular, l_currency: low?.currency, l_cut: low?.cut, l_expiry: low?.expiry,
+      l_m3: low?.low_m3, l_all: low?.low_all }),
+    elsewhere: [],
+    playMin: g.play_min || null,
+    developers: JSON.parse(g.developers || "[]"),
+    tags: JSON.parse(g.tags || "[]"),
+    prices: qPrices.all(id, country),
+    history: qDaily.all(id, country, `-${HISTORY_MONTHS} months`),
+    shots: JSON.parse(db.prepare("SELECT shots FROM media WHERE game_id = ?").get(id)?.shots || "[]").slice(0, 6),
+    requirements: (() => {
+      const m = db.prepare("SELECT req_min, req_rec FROM media WHERE game_id = ?").get(id);
+      const min = JSON.parse(m?.req_min || "[]"), rec = JSON.parse(m?.req_rec || "[]");
+      return min.length || rec.length ? { min, rec } : { min: [], rec: [], none: true, steam: !!g.appid };
+    })(),
+  } });
+});
+
+// Site ayarları, sayaçlar ve yardım sayfası bilgileri
+let statsCache = { at: 0, data: null };
+app.get("/api/config", (_req, res) => {
+  if (Date.now() - statsCache.at > 10 * 60_000) {
+    statsCache = { at: Date.now(), data: {
+      games: db.prepare("SELECT COUNT(*) AS n FROM games WHERE hidden = 0").get().n,
+      priced: db.prepare("SELECT COUNT(DISTINCT game_id) AS n FROM lows").get().n,
+      shops: db.prepare("SELECT COUNT(DISTINCT shop_name) AS n FROM prices").get().n,
+      deals: db.prepare("SELECT COUNT(*) AS n FROM lows l JOIN games g ON g.id = l.game_id WHERE g.hidden = 0 AND l.cut > 0").get().n,
+    } };
+  }
+  res.json({
+    siteName: process.env.SITE_NAME || "Fiyatavı",
+    email: process.env.SUPPORT_EMAIL || "",
+    instagram: (process.env.SUPPORT_INSTAGRAM || "").replace(/^@/, ""),
+    stats: statsCache.data,
+    controller: process.env.CONTROLLER_NAME || "",
+    rates: currentRates(),
+  });
+});
+
+// Giriş ekranının arka planı için popüler oyun kapakları
+app.get("/api/covers", (_req, res) => {
+  const rows = db.prepare(`SELECT id, title, boxart, appid FROM games
+    WHERE hidden = 0 AND (boxart IS NOT NULL OR appid IS NOT NULL)
+    ORDER BY popular_rank IS NULL, popular_rank LIMIT 60`).all();
+  res.json({ games: rows.map((r) => ({ ...r })) });
+});
+
+// Listede olmayan oyunları tüm mağazalarda ara
+app.get("/api/search", async (req, res) => {
+  const country = validCountry(req);
+  const q = String(req.query.q || "").trim().slice(0, 80);
+  if (!country || q.length < 3) return res.json({ added: 0 });
+  try { res.json({ added: await searchRemote(q, country) }); }
+  catch (e) { console.error("  arama:", e.message); res.json({ added: 0 }); }
+});
+
+/* ---------- Hesap ---------- */
+const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const cleanCountry = (c) => (COUNTRIES.includes(String(c).toUpperCase()) ? String(c).toUpperCase() : "TR");   // site Türk oyuncular için: bilinmeyen bölge Türkiye sayılır
+const cleanLang = (l) => (l === "en" ? "en" : "tr");
+const qAvatar = db.prepare("SELECT id, title, boxart, appid FROM games WHERE id = ?");
+// Yönetici: .env'deki ADMIN_EMAILS (virgülle birden fazla), boşsa SUPPORT_EMAIL
+const ADMINS = String(process.env.ADMIN_EMAILS || process.env.SUPPORT_EMAIL || "").toLowerCase().split(",").map((s) => s.trim()).filter(Boolean);
+const isAdmin = (u) => !!u && ADMINS.includes(String(u.email).toLowerCase());
+function requireAdmin(req, res, next) {
+  if (!req.user) return res.status(401).json({ code: "login" });
+  if (!isAdmin(req.user)) return res.status(403).json({ code: "forbidden" });
+  next();
+}
+const publicUser = (u) => ({ email: u.email, name: u.name, country: u.country, lang: u.lang,
+  notifyDrops: u.notify_drops !== 0, minCut: u.min_cut ?? 0, emailVerified: !!u.email_verified, weeklyDigest: u.weekly_digest !== 0,
+  isAdmin: isAdmin(u),
+  avatar: u.avatar ? { ...(qAvatar.get(u.avatar) ?? {}) } : null });
+
+app.post("/api/auth/register", async (req, res) => {
+  const email = String(req.body.email || "").trim().toLowerCase();
+  const password = String(req.body.password || "");
+  const name = String(req.body.name || "").trim().slice(0, 40) || email.split("@")[0];
+  if (!email || !password) return res.status(400).json({ code: "fill" });
+  if (!EMAIL.test(email)) return res.status(400).json({ code: "email" });
+  if (password.length < 6) return res.status(400).json({ code: "pass" });
+  if (req.body.consent !== true) return res.status(400).json({ code: "consent" });
+  if (tooManyAttempts("reg:" + req.ip)) return res.status(429).json({ code: "rate" });
+  try {
+    const info = db.prepare("INSERT INTO users (email, name, pass_hash, country, lang, email_verified, consent_at) VALUES (?, ?, ?, ?, ?, 0, datetime('now'))")
+      .run(email, name, await hashPassword(password), cleanCountry(req.body.country), cleanLang(req.body.lang));
+    const user = db.prepare("SELECT * FROM users WHERE id = ?").get(info.lastInsertRowid);
+    res.setHeader("Set-Cookie", sessionCookie(createSession(user.id)));
+    sendAccountMail("verify", user, createEmailToken(user.id, "verify", 48));
+    res.json({ user: publicUser(user) });
+  } catch (e) {
+    if (String(e.message).includes("UNIQUE")) return res.status(409).json({ code: "exists" });
+    throw e;
+  }
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  const email = String(req.body.email || "").trim().toLowerCase();
+  const password = String(req.body.password || "");
+  if (!email || !password) return res.status(400).json({ code: "fill" });
+  if (tooManyAttempts("login:" + req.ip + ":" + email)) return res.status(429).json({ code: "rate" });
+  const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
+  if (!user || !(await verifyPassword(password, user.pass_hash))) return res.status(401).json({ code: "wrong" });
+  res.setHeader("Set-Cookie", sessionCookie(createSession(user.id)));
+  res.json({ user: publicUser(user) });
+});
+
+// E-posta doğrulama bağlantısı
+app.post("/api/auth/verify", (req, res) => {
+  const uid = consumeEmailToken(req.body?.token, "verify");
+  if (!uid) return res.status(400).json({ code: "token" });
+  db.prepare("UPDATE users SET email_verified = 1 WHERE id = ?").run(uid);
+  res.json({ ok: true });
+});
+// Doğrulama mailini tekrar gönder
+app.post("/api/auth/resend", requireUser, (req, res) => {
+  if (req.user.email_verified) return res.json({ ok: true });
+  if (tooManyAttempts("resend:" + req.user.id)) return res.status(429).json({ code: "rate" });
+  sendAccountMail("verify", req.user, createEmailToken(req.user.id, "verify", 48));
+  res.json({ ok: true });
+});
+// Şifremi unuttum: hesap olsa da olmasa da aynı cevap (kimin üye olduğu anlaşılmasın)
+app.post("/api/auth/forgot", (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  if (!EMAIL.test(email)) return res.status(400).json({ code: "email" });
+  if (tooManyAttempts("forgot:" + req.ip)) return res.status(429).json({ code: "rate" });
+  const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
+  if (user) sendAccountMail("reset", user, createEmailToken(user.id, "reset", 1));
+  res.json({ ok: true });
+});
+// Yeni şifre: bağlantı tek kullanımlık, tüm eski oturumlar kapanır
+app.post("/api/auth/reset", async (req, res) => {
+  const password = String(req.body?.password || "");
+  if (password.length < 6) return res.status(400).json({ code: "pass" });
+  if (tooManyAttempts("reset:" + req.ip)) return res.status(429).json({ code: "rate" });
+  const uid = consumeEmailToken(req.body?.token, "reset");
+  if (!uid) return res.status(400).json({ code: "token" });
+  db.prepare("UPDATE users SET pass_hash = ?, email_verified = 1 WHERE id = ?").run(await hashPassword(password), uid);
+  destroyUserSessions(uid);
+  res.setHeader("Set-Cookie", sessionCookie(createSession(uid)));
+  res.json({ user: publicUser(db.prepare("SELECT * FROM users WHERE id = ?").get(uid)) });
+});
+
+app.post("/api/auth/logout", (req, res) => {
+  destroySession(req.sid);
+  res.setHeader("Set-Cookie", sessionCookie("", 0));
+  res.json({ ok: true });
+});
+
+app.get("/api/me", (req, res) => res.json({ user: req.user ? publicUser(req.user) : null }));
+
+// Şifre değiştir: mevcut şifre doğrulanır, diğer cihazlardaki oturumlar kapanır
+app.post("/api/me/password", requireUser, async (req, res) => {
+  const cur = String(req.body?.current || ""), next = String(req.body?.password || "");
+  if (next.length < 6) return res.status(400).json({ code: "pass" });
+  if (tooManyAttempts("pw:" + req.user.id)) return res.status(429).json({ code: "rate" });
+  const user = db.prepare("SELECT pass_hash FROM users WHERE id = ?").get(req.user.id);
+  if (!(await verifyPassword(cur, user.pass_hash))) return res.status(401).json({ code: "wrong" });
+  db.prepare("UPDATE users SET pass_hash = ? WHERE id = ?").run(await hashPassword(next), req.user.id);
+  destroyUserSessions(req.user.id);
+  res.setHeader("Set-Cookie", sessionCookie(createSession(req.user.id)));
+  res.json({ ok: true });
+});
+
+// Hesabı sil (şifre onayıyla); oturumlar, istek listesi ve bildirimler de silinir
+app.delete("/api/me", requireUser, async (req, res) => {
+  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(req.user.id);
+  if (!(await verifyPassword(String(req.body?.password || ""), user.pass_hash))) return res.status(401).json({ code: "wrong" });
+  for (const m of db.prepare("SELECT list_id FROM list_members WHERE user_id = ?").all(user.id)) leaveList(m.list_id, user.id);
+  db.prepare("DELETE FROM users WHERE id = ?").run(user.id);
+  res.setHeader("Set-Cookie", sessionCookie("", 0));
+  res.json({ ok: true });
+});
+
+app.patch("/api/me", requireUser, (req, res) => {
+  if (req.body.lang) db.prepare("UPDATE users SET lang = ? WHERE id = ?").run(cleanLang(req.body.lang), req.user.id);
+  if (typeof req.body.notifyDrops === "boolean") db.prepare("UPDATE users SET notify_drops = ? WHERE id = ?").run(req.body.notifyDrops ? 1 : 0, req.user.id);
+  if ([0, 25, 50, 75].includes(req.body.minCut)) db.prepare("UPDATE users SET min_cut = ? WHERE id = ?").run(req.body.minCut, req.user.id);
+  if (typeof req.body.weeklyDigest === "boolean") db.prepare("UPDATE users SET weekly_digest = ? WHERE id = ?").run(req.body.weeklyDigest ? 1 : 0, req.user.id);
+  if (typeof req.body.name === "string" && req.body.name.trim()) db.prepare("UPDATE users SET name = ? WHERE id = ?").run(req.body.name.trim().slice(0, 40), req.user.id);
+  res.json({ user: publicUser(db.prepare("SELECT * FROM users WHERE id = ?").get(req.user.id)) });
+});
+
+/* ---------- İstek listesi ve bildirimler ---------- */
+app.get("/api/wishlist", requireUser, (req, res) => {
+  const country = COUNTRIES.includes(String(req.query.country).toUpperCase()) ? String(req.query.country).toUpperCase() : req.user.country;
+  const rows = db.prepare(`SELECT ${LIST_COLS}, w.target_price, w.target_currency FROM wishlist w JOIN games g ON g.id = w.game_id
+    LEFT JOIN lows l ON l.game_id = g.id AND l.country = ? WHERE w.user_id = ? ORDER BY w.added_at`).all(country, req.user.id);
+  const targets = Object.fromEntries(rows.filter((r) => r.target_price != null).map((r) => [r.id, { price: r.target_price, currency: r.target_currency }]));
+  res.json({ ids: rows.map((r) => r.id), games: rows.map(listItem), targets });
+});
+
+app.post("/api/wishlist/:gameId", requireUser, async (req, res) => {
+  const game = db.prepare("SELECT id, title FROM games WHERE id = ?").get(req.params.gameId);
+  if (!game) return res.status(404).json({ code: "game" });
+  const r = db.prepare("INSERT OR IGNORE INTO wishlist (user_id, game_id) VALUES (?, ?)").run(req.user.id, game.id);
+  if (r.changes) await notifyAdded(req.user, game);
+  res.json({ ok: true });
+});
+
+// Hedef fiyat alarmı: { target: 499.99, currency: "TRY" } ya da { target: null } ile kaldır
+app.patch("/api/wishlist/:gameId", requireUser, (req, res) => {
+  const row = db.prepare("SELECT 1 FROM wishlist WHERE user_id = ? AND game_id = ?").get(req.user.id, req.params.gameId);
+  if (!row) return res.status(404).json({ code: "game" });
+  const t = req.body?.target;
+  if (t === null) {
+    db.prepare("UPDATE wishlist SET target_price = NULL, target_currency = NULL, target_hit = 0 WHERE user_id = ? AND game_id = ?").run(req.user.id, req.params.gameId);
+    return res.json({ ok: true });
+  }
+  const price = Number(t), cur = String(req.body?.currency || "").toUpperCase();
+  if (!(price > 0 && price < 1e7) || !/^[A-Z]{3}$/.test(cur)) return res.status(400).json({ code: "target" });
+  const low = db.prepare("SELECT price, currency FROM lows WHERE game_id = ? AND country = ?").get(req.params.gameId, req.user.country);
+  const already = !!low && low.currency === cur && low.price <= price;   // şu an zaten hedefin altındaysa
+  db.prepare("UPDATE wishlist SET target_price = ?, target_currency = ?, target_hit = ? WHERE user_id = ? AND game_id = ?")
+    .run(price, cur, already ? 1 : 0, req.user.id, req.params.gameId);
+  res.json({ ok: true, already });
+});
+
+app.delete("/api/wishlist/:gameId", requireUser, (req, res) => {
+  db.prepare("DELETE FROM wishlist WHERE user_id = ? AND game_id = ?").run(req.user.id, req.params.gameId);
+  db.prepare("DELETE FROM notifications WHERE user_id = ? AND game_id = ? AND kind = 'added'").run(req.user.id, req.params.gameId);
+  res.json({ ok: true });
+});
+
+/* ---------- Yönetim sayfası (sadece yönetici) ---------- */
+
+/* ================= Ortak listeler ================= */
+const LIST_MAX_OWNED = 5, LIST_MAX_GAMES = 100, LIST_MAX_MEMBERS = 10;
+const qListById = db.prepare("SELECT * FROM lists WHERE id = ?");
+const qListByToken = db.prepare("SELECT * FROM lists WHERE token = ?");
+const isListMember = (listId, uid) => !!db.prepare("SELECT 1 FROM list_members WHERE list_id = ? AND user_id = ?").get(listId, uid);
+const listMembers = (listId) => db.prepare(`SELECT u.id, u.name FROM list_members m JOIN users u ON u.id = m.user_id
+  WHERE m.list_id = ? ORDER BY m.joined_at, u.id`).all(listId).map((r) => ({ ...r }));
+function listGames(listId, country) {
+  return db.prepare(`SELECT ${LIST_COLS}, lg.added_by FROM list_games lg JOIN games g ON g.id = lg.game_id
+    LEFT JOIN lows l ON l.game_id = g.id AND l.country = ? WHERE lg.list_id = ? ORDER BY lg.added_at, g.title`).all(country, listId)
+    .map((r) => ({ ...listItem(r), addedBy: r.added_by }));
+}
+function listPayload(l, uid, country) {
+  const members = listMembers(l.id);
+  return { id: l.id, token: l.token, name: l.name, ownerId: l.owner_id, owner: members.find((m) => m.id === l.owner_id)?.name ?? null,
+    joined: !!uid && members.some((m) => m.id === uid), isOwner: !!uid && l.owner_id === uid, members, games: listGames(l.id, country) };
+}
+// Üye listeden çıkar; sahibi çıkarsa en eski üye sahip olur, kimse kalmazsa liste silinir
+function leaveList(listId, uid) {
+  db.prepare("DELETE FROM list_members WHERE list_id = ? AND user_id = ?").run(listId, uid);
+  const rest = listMembers(listId);
+  const l = qListById.get(listId);
+  if (!l) return;
+  if (!rest.length) { db.prepare("DELETE FROM list_games WHERE list_id = ?").run(listId); db.prepare("DELETE FROM lists WHERE id = ?").run(listId); }
+  else if (l.owner_id === uid) db.prepare("UPDATE lists SET owner_id = ? WHERE id = ?").run(rest[0].id, listId);
+}
+const putWish = db.prepare("INSERT OR IGNORE INTO wishlist (user_id, game_id) VALUES (?, ?)");
+const listCtx = (req, res) => {
+  const l = qListById.get(Number(req.params.id));
+  if (!l || !isListMember(l.id, req.user.id)) { res.status(404).json({ code: "list" }); return null; }
+  return l;
+};
+
+app.get("/api/lists", requireUser, (req, res) => {
+  const rows = db.prepare(`SELECT l.id, l.token, l.name, l.owner_id,
+      (SELECT COUNT(*) FROM list_members WHERE list_id = l.id) AS members,
+      (SELECT COUNT(*) FROM list_games WHERE list_id = l.id) AS games
+    FROM lists l JOIN list_members m ON m.list_id = l.id WHERE m.user_id = ? ORDER BY l.id`).all(req.user.id);
+  res.json({ lists: rows.map((r) => ({ id: r.id, token: r.token, name: r.name, isOwner: r.owner_id === req.user.id, members: r.members, games: r.games })) });
+});
+app.post("/api/lists", requireUser, (req, res) => {
+  const name = String(req.body?.name || "").trim().slice(0, 40);
+  if (!name) return res.status(400).json({ code: "name" });
+  if (db.prepare("SELECT COUNT(*) AS n FROM lists WHERE owner_id = ?").get(req.user.id).n >= LIST_MAX_OWNED) return res.status(400).json({ code: "listLimit" });
+  const token = crypto.randomBytes(12).toString("base64url");
+  const r = db.prepare("INSERT INTO lists (token, name, owner_id) VALUES (?, ?, ?)").run(token, name, req.user.id);
+  db.prepare("INSERT INTO list_members (list_id, user_id) VALUES (?, ?)").run(r.lastInsertRowid, req.user.id);
+  res.json({ list: listPayload(qListById.get(Number(r.lastInsertRowid)), req.user.id, req.user.country) });
+});
+// Davet bağlantısını açan herkes (giriş yapmasa da) listeyi önizleyebilir
+app.get("/api/lists/join/:token", (req, res) => {
+  if (!/^[\w-]{10,40}$/.test(req.params.token)) return res.status(404).json({ code: "list" });
+  const l = qListByToken.get(req.params.token);
+  if (!l) return res.status(404).json({ code: "list" });
+  res.json({ list: listPayload(l, req.user?.id, "TR") });
+});
+app.post("/api/lists/join/:token", requireUser, (req, res) => {
+  const l = /^[\w-]{10,40}$/.test(req.params.token) ? qListByToken.get(req.params.token) : null;
+  if (!l) return res.status(404).json({ code: "list" });
+  if (!isListMember(l.id, req.user.id)) {
+    if (listMembers(l.id).length >= LIST_MAX_MEMBERS) return res.status(400).json({ code: "listFull" });
+    tx(() => {
+      db.prepare("INSERT INTO list_members (list_id, user_id) VALUES (?, ?)").run(l.id, req.user.id);
+      for (const g of db.prepare("SELECT game_id FROM list_games WHERE list_id = ?").all(l.id)) putWish.run(req.user.id, g.game_id);
+    });
+  }
+  res.json({ list: listPayload(l, req.user.id, req.user.country) });
+});
+app.get("/api/lists/:id", requireUser, (req, res) => {
+  const l = listCtx(req, res); if (!l) return;
+  res.json({ list: listPayload(l, req.user.id, req.user.country) });
+});
+app.post("/api/lists/:id/games", requireUser, (req, res) => {
+  const l = listCtx(req, res); if (!l) return;
+  const game = db.prepare("SELECT id FROM games WHERE id = ? AND hidden = 0").get(String(req.body?.gameId || ""));
+  if (!game) return res.status(404).json({ code: "game" });
+  if (db.prepare("SELECT COUNT(*) AS n FROM list_games WHERE list_id = ?").get(l.id).n >= LIST_MAX_GAMES) return res.status(400).json({ code: "listGames" });
+  tx(() => {
+    db.prepare("INSERT OR IGNORE INTO list_games (list_id, game_id, added_by) VALUES (?, ?, ?)").run(l.id, game.id, req.user.id);
+    for (const m of listMembers(l.id)) putWish.run(m.id, game.id);
+  });
+  res.json({ list: listPayload(l, req.user.id, req.user.country) });
+});
+app.delete("/api/lists/:id/games/:gameId", requireUser, (req, res) => {
+  const l = listCtx(req, res); if (!l) return;
+  db.prepare("DELETE FROM list_games WHERE list_id = ? AND game_id = ?").run(l.id, req.params.gameId);
+  res.json({ list: listPayload(l, req.user.id, req.user.country) });
+});
+app.post("/api/lists/:id/leave", requireUser, (req, res) => {
+  const l = listCtx(req, res); if (!l) return;
+  leaveList(l.id, req.user.id);
+  res.json({ ok: true });
+});
+app.delete("/api/lists/:id", requireUser, (req, res) => {
+  const l = listCtx(req, res); if (!l) return;
+  if (l.owner_id !== req.user.id) return res.status(403).json({ code: "forbidden" });
+  db.prepare("DELETE FROM list_games WHERE list_id = ?").run(l.id);
+  db.prepare("DELETE FROM list_members WHERE list_id = ?").run(l.id);
+  db.prepare("DELETE FROM lists WHERE id = ?").run(l.id);
+  res.json({ ok: true });
+});
+
+// Yönetim paneli grafikleri: son N günde günlük yeni üye ve istek listesi eklemesi (eksik günler 0)
+function dailySeries(days) {
+  const bucket = (sql) => Object.fromEntries(db.prepare(sql).all(`-${days - 1} days`).map((r) => [r.d, r.n]));
+  const users = bucket("SELECT date(created_at) AS d, COUNT(*) AS n FROM users WHERE date(created_at) >= date('now', ?) GROUP BY d");
+  const wish = bucket("SELECT date(added_at) AS d, COUNT(*) AS n FROM wishlist WHERE date(added_at) >= date('now', ?) GROUP BY d");
+  const out = [];
+  for (let i = days - 1; i >= 0; i--) {
+    const d = new Date(Date.now() - i * 864e5).toISOString().slice(0, 10);
+    out.push({ day: d, users: users[d] || 0, wishes: wish[d] || 0 });
+  }
+  return out;
+}
+const maskEmail = (e) => String(e).replace(/^(.)(.*)(@.*)$/, (_, a, b, c) => a + "*".repeat(Math.min(b.length, 6)) + c);
+const started = Date.now();
+app.get("/api/admin/stats", requireAdmin, (_req, res) => {
+  const one = (sql, ...a) => db.prepare(sql).get(...a);
+  const n = (sql, ...a) => one(sql, ...a)?.n ?? 0;
+  const dbFile = process.env.DB_PATH || "ganimet.db";
+  const size = [dbFile, dbFile + "-wal"].reduce((s, f) => { try { return s + fs.statSync(f).size; } catch { return s; } }, 0);
+  res.json({
+    users: {
+      total: n("SELECT COUNT(*) AS n FROM users"),
+      verified: n("SELECT COUNT(*) AS n FROM users WHERE email_verified = 1"),
+      new7: n("SELECT COUNT(*) AS n FROM users WHERE created_at >= datetime('now', '-7 days')"),
+      online: n("SELECT COUNT(DISTINCT user_id) AS n FROM sessions WHERE expires_at > datetime('now')"),
+      digestOn: n("SELECT COUNT(*) AS n FROM users WHERE weekly_digest = 1 AND email_verified = 1"),
+    },
+    wishlist: {
+      total: n("SELECT COUNT(*) AS n FROM wishlist"),
+      users: n("SELECT COUNT(DISTINCT user_id) AS n FROM wishlist"),
+      targets: n("SELECT COUNT(*) AS n FROM wishlist WHERE target_price IS NOT NULL"),
+      top: db.prepare(`SELECT g.title, COUNT(*) AS n FROM wishlist w JOIN games g ON g.id = w.game_id
+        GROUP BY w.game_id ORDER BY n DESC, g.title LIMIT 5`).all().map((r) => ({ ...r })),
+    },
+    games: {
+      total: n("SELECT COUNT(*) AS n FROM games WHERE hidden = 0"),
+      priced: n("SELECT COUNT(*) AS n FROM games WHERE hidden = 0 AND last_priced IS NOT NULL"),
+      prices: n("SELECT COUNT(*) AS n FROM prices"),
+      history: n("SELECT COUNT(*) AS n FROM price_history"),
+      onSale: n("SELECT COUNT(DISTINCT game_id) AS n FROM lows WHERE cut > 0"),
+    },
+    mails: {
+      total: n("SELECT COUNT(*) AS n FROM notifications"),
+      byKind: db.prepare(`SELECT kind, COUNT(*) AS n FROM notifications WHERE sent_at >= datetime('now', '-7 days')
+        GROUP BY kind ORDER BY n DESC`).all().map((r) => ({ ...r })),
+      recent: db.prepare(`SELECT n.kind, n.text, n.sent_at, u.email FROM notifications n JOIN users u ON u.id = n.user_id
+        ORDER BY n.id DESC LIMIT 8`).all().map((r) => ({ kind: r.kind, text: r.text, sentAt: r.sent_at, to: maskEmail(r.email) })),
+      smtp: !!process.env.SMTP_HOST,
+    },
+    daily: dailySeries(14),
+    recentUsers: db.prepare("SELECT name, email, created_at, email_verified FROM users ORDER BY id DESC LIMIT 5").all()
+      .map((u) => ({ name: u.name, email: maskEmail(u.email), createdAt: u.created_at, verified: !!u.email_verified })),
+    system: {
+      lastSync: qMeta.get()?.value ?? null, ratesAt: currentRates().updatedAt, api: { used: itadUsage(), limit: ITAD_LIMIT },
+      dbBytes: size, uptimeSec: Math.round((Date.now() - started) / 1000), node: process.version,
+    },
+  });
+});
+// Haftalık özetin bir örneğini hemen yöneticinin kendisine gönder (deneme için)
+app.post("/api/admin/digest-test", requireAdmin, async (req, res) => {
+  const user = db.prepare("SELECT email_verified FROM users WHERE id = ?").get(req.user.id);
+  if (!user?.email_verified) return res.status(400).json({ code: "unverified" });
+  if (!db.prepare("SELECT 1 FROM wishlist WHERE user_id = ?").get(req.user.id)) return res.status(400).json({ code: "emptyWish" });
+  const sent = await sendWeeklyDigests({ force: true, onlyUserId: req.user.id });
+  res.json({ sent, smtp: !!process.env.SMTP_HOST });
+});
+
+app.get("/api/notifications", requireUser, (req, res) => {
+  res.json({ items: db.prepare("SELECT kind, text, sent_at FROM notifications WHERE user_id = ? ORDER BY id DESC LIMIT 20").all(req.user.id) });
+});
+
+// Bilinmeyen adresler: API için kısa bir hata, sayfalar için "Cannot GET" yerine sitenin kendisi (404 durumuyla)
+app.use((req, res) => {
+  if (req.path.startsWith("/api/")) return res.status(404).json({ code: "notfound" });
+  res.status(404).type("html").send(page());
+});
+app.use((err, _req, res, _next) => {
+  console.error(err);
+  res.status(500).json({ code: "server" });
+});
+
+/* ---------- Zamanlayıcı ---------- */
+let running = false;
+async function tick() {
+  if (running) return;
+  running = true;
+  try { dailyBackup(); await refreshRates(); purgeBlocked(); await runSync(); await sendWeeklyDigests(); cleanupSessions(); await checkShops(); startBackgroundWork(); }
+  catch (e) { console.error("Senkronizasyon hatası:", [e.message, e.cause?.code].filter(Boolean).join(" — "), e.cause?.code ? "(internet bağlantısını ya da güvenlik duvarını kontrol et)" : ""); }
+  finally { running = false; }
+}
+
+// Günlük veri tabanı yedeği: yedek/ klasörüne tarihli kopya; son 7 gün tutulur.
+// VACUUM INTO, site çalışırken bile tutarlı bir kopya alır.
+function dailyBackup() {
+  const dir = process.env.BACKUP_DIR || "yedek";
+  if (process.env.BACKUP_DIR === "off") return;
+  const day = new Date().toISOString().slice(0, 10);
+  const file = path.join(dir, `ganimet-${day}.db`);
+  if (fs.existsSync(file)) return;
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    db.exec(`VACUUM INTO '${file.replace(/'/g, "''")}'`);
+    const old = fs.readdirSync(dir).filter((f) => /^ganimet-\d{4}-\d{2}-\d{2}\.db$/.test(f)).sort().slice(0, -7);
+    for (const f of old) fs.unlinkSync(path.join(dir, f));
+    console.log(`  yedek alındı: ${file}`);
+  } catch (e) { console.error("  yedek alınamadı:", e.message); }
+}
+
+const port = Number(process.env.PORT || 3000);
+const httpServer = app.listen(port, () => {
+  console.log(`${process.env.SITE_NAME || "Fiyatavı"} çalışıyor → http://localhost:${port}`);
+  tick();
+  setInterval(tick, Number(process.env.SYNC_MINUTES || 60) * 60_000);
+});
+httpServer.on("error", (e) => {
+  if (e.code === "EADDRINUSE") {
+    console.error(`\n✗ ${port} numaralı kapı kullanımda: büyük ihtimalle sunucu başka bir terminal penceresinde zaten açık.`);
+    console.error("  O pencerede Ctrl + C ile durdur ya da hepsini kapatmak için şunu yaz:  taskkill /IM node.exe /F\n");
+    process.exit(1);
+  }
+  throw e;
+});

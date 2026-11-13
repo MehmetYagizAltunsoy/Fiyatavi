@@ -1,0 +1,26 @@
+# Paketler (npm install ile yeniden kurulur)
+node_modules/
+
+# Gizli ayarlar: API anahtarları, mail şifresi — ASLA yüklenmemeli
+.env
+
+# Veri tabanı (kullanıcı hesapları, fiyatlar)
+*.db
+*.db-wal
+*.db-shm
+
+# Sistem ve düzenleyici dosyaları
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
+npm-debug.log*
+
+# Günlük veri tabanı yedekleri
+yedek/
+
+# PHP sürümü: gizli ayarlar ve veri klasörü (data/.htaccess hariç tutulmaz)
+php/.env
+php/data/*
+!php/data/.htaccess
