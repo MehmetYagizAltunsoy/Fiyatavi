@@ -9,15 +9,11 @@ Projenin **iki ayrı sunucu tarafı** vardır, ikisi de bu depoda bulunur ve ayn
 - **`/` (kök dizin) — Node.js / Express sürümü:** Sitenin asıl, sürekli geliştirilen sürümü.
 - **`/php` — PHP 8 sürümü:** Aynı sitenin PHP ile yazılmış, aynı veri tabanı şemasını kullanan karşılığı (paylaşımlı/ücretsiz PHP barındırma gibi Node çalıştıramayan ortamlarda kullanılmak üzere).
 
-## Tanıtım videosu
+## Tanıtım videosu ve proje dosyaları (Google Drive)
 
-[![Fiyatavı tanıtım videosu](docs/fiyatavi_tanitim_thumb.jpg)](https://drive.google.com/file/d/1G1NJqKg2i4mPUCyMDCC30rZ5Ck6W8xAV/view?usp=sharing)
+[![Fiyatavı tanıtım videosu](docs/fiyatavi_tanitim_thumb.jpg)](https://drive.google.com/drive/folders/13siYVvzz3Wcq8PfYRrKXvoz32JrWXNzF?usp=sharing)
 
-Videoyu izlemek için görsele tıklayın (Google Drive üzerinden).
-
-## Proje dosyaları (Google Drive)
-
-Bu depodaki tüm dosyaların Google Drive üzerindeki kopyası: [Fiyatavı - Proje Dosyaları](https://drive.google.com/drive/folders/13siYVvzz3Wcq8PfYRrKXvoz32JrWXNzF?usp=sharing)
+Görsele ya da [Fiyatavı - Proje Dosyaları](https://drive.google.com/drive/folders/13siYVvzz3Wcq8PfYRrKXvoz32JrWXNzF?usp=sharing) linkine tıklayınca aynı Google Drive klasörü açılır: içinde hem tanıtım videosu hem de bu depodaki tüm dosyaların kopyası bulunur.
 
 ## Özellikler
 
