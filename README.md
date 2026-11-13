@@ -11,9 +11,13 @@ Projenin **iki ayrı sunucu tarafı** vardır, ikisi de bu depoda bulunur ve ayn
 
 ## Tanıtım videosu
 
-[![Fiyatavı tanıtım videosu](docs/fiyatavi_tanitim_thumb.jpg)](https://drive.google.com/TANITIM_VIDEOSU_LINKI)
+[![Fiyatavı tanıtım videosu](docs/fiyatavi_tanitim_thumb.jpg)](https://drive.google.com/file/d/1G1NJqKg2i4mPUCyMDCC30rZ5Ck6W8xAV/view?usp=sharing)
 
-Videoyu izlemek için görsele tıklayın.
+Videoyu izlemek için görsele tıklayın (Google Drive üzerinden).
+
+## Proje dosyaları (Google Drive)
+
+Bu depodaki tüm dosyaların Google Drive üzerindeki kopyası: [Fiyatavı - Proje Dosyaları](https://drive.google.com/drive/folders/13siYVvzz3Wcq8PfYRrKXvoz32JrWXNzF?usp=sharing)
 
 ## Özellikler
 
